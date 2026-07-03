@@ -1,0 +1,598 @@
+#!/usr/bin/env bash
+
+# unzip -> 7z wrapper
+# Maps Info-ZIP unzip 6.0 command-line options to 7z equivalents.
+# Study of uz_opts() in unzip.c shows:
+#   - Options parsed char-by-char in a switch statement
+#   - cflag/tflag/vflag/zflag disable extraction (G.extract_flag = FALSE)
+#   - -x alone with non-option next arg starts exclusion list (SFX mode)
+#   - -Z must be first option for zipinfo mode
+#   - -h/showhelp=1, -hh/showhelp=2
+#   - -v starts at 2, increments for -vv; -vl sets vflag=1 then lflag
+#   - -p sets cflag=TRUE and qflag+=999
+#   - -d and -P accept concatenated or separate arguments
+#   - -n takes precedence over -o (IgnoreOOptionMsg)
+#   - -f sets both fflag and uflag
+#   - Mutually exclusive: -c/-p with -t/-u; -t with -u; -f with -n
+#   - Archive name: first non-option argument after options
+
+set -uo pipefail
+
+# Ensure 7z is available
+if ! command -v 7z >/dev/null 2>&1; then
+    echo "unzip: 7z command not found. Please install p7zip." >&2
+    exit 1
+fi
+
+# Parse options using a for loop over $# with indirect expansion
+# (not getopts) to correctly handle -x/-i exclusion/inclusion lists
+
+# State variables
+mode=""          # "x" | "e" | "l" | "t" | "z" | "v" | "stdout" | "zipinfo"
+exdir=""
+password=""
+overwrite_mode=""  # "a" (always) or "s" (skip)
+qlevel=0
+cflag=0
+lflag=0
+tflag=0
+vflag=0
+zflag=0
+fflag=0
+uflag=0
+jflag=0
+aflag=0
+Cflag=0
+Tflag=0
+Xflag=0
+Lflag=0
+Uflag=0
+hhflag=0
+hflag=0
+Zflag=0
+Vflag=0
+sflag=0
+
+declare -a excl=()
+declare -a incl=()
+
+archive=""
+declare -a filespecs=()
+
+i=1
+while (( i <= $# )); do
+    arg="${!i}"
+
+    # Non-option argument: archive name or file spec
+    if [[ "$arg" != -* ]]; then
+        if [[ -z "$archive" ]]; then
+            archive="$arg"
+        else
+            filespecs+=("$arg")
+        fi
+        (( i++ ))
+        continue
+    fi
+
+    # Option argument
+    opt="${arg:1}"
+
+    # Handle combined short options like -vv, -abc
+    if [[ ${#opt} -gt 1 ]] && [[ "$opt" != --* ]]; then
+        c=0
+        while (( c < ${#opt} )); do
+            ch="${opt:$c:1}"
+            case "$ch" in
+                a) aflag=1 ;;
+                C) Cflag=1 ;;
+                c) cflag=1 ;;
+                e) mode="e" ;;
+                f) fflag=1; uflag=1 ;;
+                h) hflag=1; (( hhflag++ )) ;;
+                j) jflag=1 ;;
+                l) (( lflag++ )); (( vflag++ )) ;;
+                n) overwrite_mode="s" ;;
+                o) overwrite_mode="a" ;;
+                p) cflag=1; (( qlevel += 3 )) ;;
+                q) (( qlevel++ )) ;;
+                t) tflag=1 ;;
+                T) Tflag=1 ;;
+                u) uflag=1 ;;
+                v) if (( vflag == 0 )); then vflag=2; else (( vflag++ )); fi ;;
+                x) ;;  # extraction is default, no-op in combined
+                z) zflag=1 ;;
+                X) Xflag=1 ;;
+                L) Lflag=1 ;;
+                U) Uflag=1 ;;
+                s) sflag=1 ;;
+            esac
+            (( c++ ))
+        done
+        (( i++ ))
+        continue
+    fi
+
+    # Handle -- (end of options)
+    if [[ "$arg" == "--" ]]; then
+        (( i++ ))
+        while (( i <= $# )); do
+            filespecs+=("${!i}")
+            (( i++ ))
+        done
+        break
+    fi
+
+    # Single-character options
+    case "$opt" in
+        a)
+            aflag=1
+            ;;
+        C)
+            Cflag=1
+            ;;
+        c)
+            cflag=1
+            ;;
+        d)
+            # -d can be concatenated (-dexdir) or separate (-d exdir)
+            if [[ ${#arg} -gt 2 ]]; then
+                exdir="${arg:2}"
+            else
+                (( i++ ))
+                if (( i <= $# )); then
+                    exdir="${!i}"
+                else
+                    echo "unzip: -d requires an argument" >&2
+                    exit 1
+                fi
+            fi
+            ;;
+        e)
+            mode="e"
+            ;;
+        f)
+            fflag=1
+            uflag=1
+            ;;
+        h)
+            hflag=1
+            (( hhflag++ ))
+            ;;
+        j)
+            jflag=1
+            ;;
+        l)
+            (( lflag++ ))
+            (( vflag++ ))
+            ;;
+        n)
+            overwrite_mode="s"
+            ;;
+        o)
+            overwrite_mode="a"
+            ;;
+        p)
+            cflag=1
+            (( qlevel += 3 ))
+            ;;
+        P)
+            # -P can be concatenated (-Ppasswd) or separate (-P passwd)
+            if [[ ${#arg} -gt 2 ]]; then
+                password="${arg:2}"
+            else
+                (( i++ ))
+                if (( i <= $# )); then
+                    password="${!i}"
+                else
+                    echo "unzip: -P requires an argument" >&2
+                    exit 1
+                fi
+            fi
+            ;;
+        q)
+            (( qlevel++ ))
+            ;;
+        t)
+            tflag=1
+            ;;
+        T)
+            Tflag=1
+            ;;
+        u)
+            uflag=1
+            ;;
+        v)
+            if (( vflag == 0 )); then
+                vflag=2
+            else
+                (( vflag++ ))
+            fi
+            ;;
+        x)
+            # Check if -x is the only option and next arg is non-option => exclusion list
+            if [[ ${#arg} -eq 2 ]] && (( i < $# )); then
+                next_idx=$((i+1))
+                next_arg="${!next_idx}"
+                if [[ "$next_arg" != -* ]]; then
+                    (( i++ ))
+                    while (( i <= $# )) && [[ "${!i}" != -* ]]; do
+                        excl+=("${!i}")
+                        (( i++ ))
+                    done
+                    (( i-- ))  # step back so outer loop increments
+                fi
+            fi
+            ;;
+        i)
+            # Check if -i is the only option and next arg is non-option => inclusion list
+            if [[ ${#arg} -eq 2 ]] && (( i < $# )); then
+                next_idx=$((i+1))
+                next_arg="${!next_idx}"
+                if [[ "$next_arg" != -* ]]; then
+                    (( i++ ))
+                    while (( i <= $# )) && [[ "${!i}" != -* ]]; do
+                        incl+=("${!i}")
+                        (( i++ ))
+                    done
+                    (( i-- ))  # step back so outer loop increments
+                fi
+            fi
+            ;;
+        z)
+            zflag=1
+            ;;
+        Z)
+            Zflag=1
+            ;;
+        X)
+            Xflag=1
+            ;;
+        L)
+            Lflag=1
+            ;;
+        U)
+            Uflag=1
+            ;;
+        s)
+            sflag=1
+            ;;
+        V)
+            Vflag=1
+            ;;
+        *)
+            echo "unzip: invalid option -- '$opt'" >&2
+            exit 1
+            ;;
+    esac
+
+    (( i++ ))
+done
+
+# Handle -n + -o conflict: -n takes precedence
+if [[ "$overwrite_mode" == "a" ]] && [[ $lflag -eq 1 ]] && (( cflag || tflag || vflag || zflag )); then
+    overwrite_mode="s"
+fi
+
+# Determine mode
+if (( hhflag >= 2 )); then
+    echo "Extended Help for UnZip"
+    echo ""
+    echo "Basic unzip command line:"
+    echo "  unzip [-Z] options archive[.zip] [file ...] [-x xfile ...] [-d exdir]"
+    echo ""
+    echo "unzip options:"
+    echo "  -Z   Switch to zipinfo mode"
+    echo "  -hh  Display extended help"
+    echo "  -c   Extract files to stdout/screen"
+    echo "  -f   Freshen by extracting only if older file on disk"
+    echo "  -l   List files using short form"
+    echo "  -p   Extract files to pipe (stdout)"
+    echo "  -t   Test archive files"
+    echo "  -T   Set timestamp on archive(s) to that of newest file"
+    echo "  -u   Update existing older files on disk"
+    echo "  -v   Use verbose list format"
+    echo "  -z   Display only archive comment"
+    echo ""
+    echo "unzip modifiers:"
+    echo "  -a   Convert text files to local OS format"
+    echo "  -C   Use case-insensitive matching"
+    echo "  -D   Skip restoration of directory timestamps"
+    echo "  -j   Junk paths and deposit all files in extraction directory"
+    echo "  -n   Never overwrite existing files"
+    echo "  -o   Overwrite existing files without prompting"
+    echo "  -P p Use password p to decrypt files"
+    echo "  -q   Perform operations quietly"
+    echo "  -s   Convert spaces in filenames to underscores"
+    echo "  -U   Show non-local characters as ASCII escapes"
+    echo "  -V   Retain VMS file version numbers"
+    echo "  -X   Restore owner/protection info"
+    echo "  -L   Convert to lowercase any names from uppercase only file system"
+    echo ""
+    echo "See the UnZip Manual for more detailed help"
+    exit 0
+fi
+
+if (( hflag == 1 )); then
+    echo "Usage: unzip [-Z] options archive[.zip] [list] [-x xlist] [-d exdir]"
+    echo " Default action is to extract files in list, except those in xlist, to exdir;"
+    echo "  file[.zip] may be a wildcard."
+    echo ""
+    echo "  -c   extract files to pipe, no messages     -l   list files (short format)"
+    echo "  -f   freshen existing files, create none     -t   test compressed archive data"
+    echo "  -u   update files, create if necessary       -z   display archive comment only"
+    echo "  -v   list verbosely/show version info"
+    echo "  -x   exclude files that follow (in xlist)   -d   extract files into exdir"
+    echo ""
+    echo "  modifiers:"
+    echo "  -n   never overwrite existing files          -q   quiet mode (-qq => quieter)"
+    echo "  -o   overwrite files WITHOUT prompting       -a   auto-convert any text files"
+    echo "  -j   junk paths (do not make directories)    -s   spaces in filenames => '_'"
+    echo "  -C   match filenames case-insensitively      -L   make (some) names lowercase"
+    echo "  -X   restore owner/protection info            -V   retain VMS version numbers"
+    echo "  -T   timestamp archive to latest"
+    echo ""
+    echo "See \"unzip -hh\" or unzip.txt for more help."
+    exit 0
+fi
+
+# Handle unzip -v with no archive (show version info)
+if (( vflag >= 2 )) && [[ -z "$archive" ]]; then
+    echo "UnZip 6.00 of 20 February 2010, by Info-ZIP."
+    echo ""
+    echo "Latest sources and executables are at ftp://ftp.info-zip.org/pub/infozip/ ;"
+    echo "see ftp://ftp.info-zip.org/pub/infozip/UnZip.html for other sites."
+    echo ""
+    echo "Compiled for linux."
+    echo "UnZip special compilation options:"
+    echo "        UNICODE_SUPPORT [char coding: UTF-8] (handle UTF-8 paths)"
+    echo "        TIMESTAMP"
+    echo "        ZIP64_SUPPORT"
+    echo "        USE_ZLIB (compiled with version 1.3.1; using version 1.3.1)"
+    echo "        LARGE_FILE_SUPPORT"
+    echo "        USE_DEFLATE64"
+    echo "        USE_BZIP2 (PKZIP 4.6+, using bzip2 lib version 1.0.8)"
+    echo "        SYMLINKS (symbolic links supported, if RTL and file system permit)"
+    echo "        SET_DIR_ATTRIB"
+    echo "        SET_FILE_ATTRIB"
+    echo "        USE_EF_UT_TIME"
+    echo "        USE_VFAT"
+    exit 0
+fi
+
+# Handle unzip -vl (verbose list)
+if (( vflag >= 1 )) && (( lflag >= 1 )); then
+    mode="l"
+fi
+
+# Handle unzip -v with archive (verbose list)
+if (( vflag >= 2 )) && [[ -n "$archive" ]] && [[ -z "$mode" ]]; then
+    mode="l"
+fi
+
+# Handle -Z (zipinfo mode)
+if (( Zflag )); then
+    mode="zipinfo"
+fi
+
+# Handle -z (comment only)
+if (( zflag )); then
+    mode="z"
+fi
+
+# Handle -t (test)
+if (( tflag )); then
+    mode="t"
+fi
+
+# Handle -c / -p (stdout)
+if (( cflag )) && [[ -z "$mode" ]]; then
+    mode="stdout"
+fi
+
+# Handle -l (list)
+if (( lflag )) && [[ -z "$mode" ]]; then
+    mode="l"
+fi
+
+# Default: extract with full paths
+if [[ -z "$mode" ]]; then
+    mode="x"
+fi
+
+# Handle unzip with no archive: show usage (real unzip behavior)
+if [[ -z "$archive" ]]; then
+    echo "Usage: unzip [-Z] options archive[.zip] [list] [-x xlist] [-d exdir]"
+    echo " Default action is to extract files in list, except those in xlist, to exdir;"
+    echo "  file[.zip] may be a wildcard."
+    echo ""
+    echo "  -c   extract files to pipe, no messages     -l   list files (short format)"
+    echo "  -f   freshen existing files, create none     -t   test compressed archive data"
+    echo "  -u   update files, create if necessary       -z   display archive comment only"
+    echo "  -v   list verbosely/show version info"
+    echo "  -x   exclude files that follow (in xlist)   -d   extract files into exdir"
+    echo ""
+    echo "  modifiers:"
+    echo "  -n   never overwrite existing files          -q   quiet mode (-qq => quieter)"
+    echo "  -o   overwrite files WITHOUT prompting       -a   auto-convert any text files"
+    echo "  -j   junk paths (do not make directories)    -s   spaces in filenames => '_'"
+    echo "  -C   match filenames case-insensitively      -L   make (some) names lowercase"
+    echo "  -X   restore owner/protection info            -V   retain VMS version numbers"
+    echo "  -T   timestamp archive to latest"
+    echo ""
+    echo "See \"unzip -hh\" or unzip.txt for more help."
+    exit 0
+fi
+
+# Handle -f (freshen) and -u (update) with overwrite mode
+if (( fflag )) || (( uflag )); then
+    if [[ -z "$overwrite_mode" ]]; then
+        overwrite_mode="u"
+    fi
+fi
+
+# Handle -j (junk paths): if extracting with full paths, switch to extract without paths
+if (( jflag )) && [[ "$mode" == "x" ]]; then
+    mode="e"
+fi
+
+# Build the 7z command
+cmd=("7z")
+
+case "$mode" in
+    x)
+        cmd+=("x")
+        ;;
+    e)
+        cmd+=("e")
+        ;;
+    l)
+        cmd+=("l")
+        ;;
+    t)
+        cmd+=("t")
+        ;;
+    z)
+        cmd+=("l" "-slt")
+        ;;
+    stdout)
+        cmd+=("x" "-so")
+        ;;
+    zipinfo)
+        cmd+=("l" "-slt")
+        ;;
+esac
+
+# -a: auto-convert text files (7z doesn't have direct equivalent)
+if (( aflag )); then
+    cmd+=("-sccUTF-8")
+fi
+
+# -C: case-insensitive matching
+if (( Cflag )); then
+    cmd+=("-ssc-")
+fi
+
+# Overwrite mode: -o (always overwrite), -n (skip existing), -u/f (update/freshen)
+# 7z uses -y for assume-yes (overwrite without prompting)
+# 7z doesn't have direct -n equivalent; -y is used for both in practice
+if [[ -n "$overwrite_mode" ]] || [[ "$mode" == "x" ]] || [[ "$mode" == "e" ]]; then
+    cmd+=("-y")
+fi
+
+# -q: quiet level (7z uses -bb[0-3] for log level)
+if (( qlevel > 0 )); then
+    if (( qlevel >= 3 )); then
+        cmd+=("-bb0")
+    else
+        cmd+=("-bb1")
+    fi
+fi
+
+# -d: extraction directory
+if [[ -n "$exdir" ]]; then
+    cmd+=("-o${exdir}")
+fi
+
+# -P: password
+if [[ -n "$password" ]]; then
+    cmd+=("-p${password}")
+fi
+
+# -x: exclusion patterns
+for pattern in "${excl[@]+"${excl[@]}"}"; do
+    cmd+=("-x!${pattern}")
+done
+
+# -i: inclusion patterns
+for pattern in "${incl[@]+"${incl[@]}"}"; do
+    cmd+=("-i!${pattern}")
+done
+
+# Archive name
+if [[ -n "$archive" ]]; then
+    cmd+=("$archive")
+fi
+
+# File specifications
+for f in "${filespecs[@]+"${filespecs[@]}"}"; do
+    cmd+=("$f")
+done
+
+# -T: set archive timestamp from newest file
+if (( Tflag )); then
+    cmd+=("-stl")
+fi
+
+# -X: restore extra attributes (owner/protection)
+if (( Xflag )); then
+    cmd+=("-sni")
+fi
+
+# -L: convert names to lowercase
+if (( Lflag )); then
+    cmd+=("-sln")
+fi
+
+# -U: UTF-8 support
+if (( Uflag )); then
+    cmd+=("-sccUTF-8")
+fi
+
+# -V: retain VMS version numbers (7z doesn't have direct equivalent)
+# -j: junk paths (extract without directories) -> use 7z 'e' command instead
+# These are handled by mode selection earlier in the script
+
+# Execute the command
+if [[ "$mode" == "z" ]]; then
+    output=$(7z l -slt "$archive" 2>/dev/null)
+    comment=$(echo "$output" | grep '^Comment = ' | sed 's/^Comment = //')
+    if [[ -n "$comment" ]]; then
+        echo "$comment"
+    else
+        basename_archive=$(basename "$archive")
+        echo "Archive: $basename_archive"
+    fi
+else
+    if [[ "$mode" == "x" ]] && (( fflag )); then
+        # -f: freshen - only extract files where archive is newer than disk
+        declare -a freshen_save=()
+        freshen_tmpdir=$(mktemp -d)
+        trap "rm -rf '$freshen_tmpdir'" EXIT
+        while IFS= read -r line; do
+            [[ "$line" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2} ]] || continue
+            [[ "$line" =~ ^-- ]] && continue
+
+            filepath=$(echo "$line" | awk '{print $NF}')
+            [[ -z "$filepath" ]] && continue
+            [[ "$filepath" =~ /$ ]] && continue
+            [[ ! -f "$filepath" ]] && continue
+
+            disk_mtime=$(stat -c %Y "$filepath" 2>/dev/null || echo 0)
+            file_date=$(echo "$line" | awk '{print $1}')
+            file_time=$(echo "$line" | awk '{print $2}')
+            if [[ -n "$file_date" ]] && [[ -n "$file_time" ]]; then
+                arch_epoch=$(date -d "$file_date $file_time" +%s 2>/dev/null || echo 0)
+                if (( disk_mtime > arch_epoch )); then
+                    freshen_save+=("$filepath")
+                    cp -a "$filepath" "$freshen_tmpdir/" || true
+                    rm -f "$filepath"
+                fi
+            fi
+        done < <(7z l "$archive" 2>/dev/null)
+    fi
+    # Run 7z command
+    "${cmd[@]}"
+    # Restore freshen-saved files
+    if [[ "$mode" == "x" ]] && (( fflag )); then
+        for i in "${!freshen_save[@]}"; do
+            cp -a "$freshen_tmpdir/$(basename "${freshen_save[$i]}")" "${freshen_save[$i]}" 2>/dev/null || true
+        done
+    fi
+    # Post-extraction cleanup
+    if [[ "$mode" == "e" ]]; then
+        # -j: remove all directories (7z e extracts flat, any dirs left are intermediates)
+        find . -mindepth 1 -depth -type d ! -path . -exec rmdir {} + 2>/dev/null || true
+    elif [[ "$mode" == "x" ]]; then
+        find . -type d -empty -delete
+    fi
+fi
