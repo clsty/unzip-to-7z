@@ -6,7 +6,7 @@ A `7z`-based replacement for the `unzip` command.
 
 The original `unzip` (Info-ZIP) remains the default on most systems, and many tools expect it to be present. However, it has seen little development since 2009 and sometimes [mangles non-ASCII characters](https://github.com/clsty/zip-encoding-test/blob/e7aa4499f928c241d2eec5ebf3ceacae41d4f452/test-report.md).
 
-This wrapper uses `7z` under the hood to provide correct both `UTF-8` and non-`UTF-8` filename handling while maintaining a compatible command-line interface. Options are parsed and mapped based on `unzip` 6.0's `uz_opts()` logic.
+This wrapper uses `7z` under the hood to provide better encoding handling for both `UTF-8` and non-`UTF-8` filenames inside ZIP archives while maintaining a compatible command-line interface. Options are parsed and mapped based on `unzip` 6.0's `uz_opts()` logic.
 
 ## Installation
 
