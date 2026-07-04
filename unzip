@@ -20,7 +20,7 @@ set -uo pipefail
 
 # Ensure 7z is available
 if ! command -v 7z >/dev/null 2>&1; then
-    echo "unzip: 7z command not found. Please install p7zip." >&2
+    echo "unzip: 7z command not found. Please install 7-zip or p7zip." >&2
     exit 1
 fi
 
