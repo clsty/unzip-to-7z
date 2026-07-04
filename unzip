@@ -19,8 +19,9 @@
 set -uo pipefail
 
 # Ensure 7z is available
-if ! command -v 7z >/dev/null 2>&1; then
-    echo "unzip: 7z command not found. Please install 7-zip or p7zip." >&2
+SEVEN_ZIP_EXECUTABLE="${SEVEN_ZIP_EXECUTABLE:-7z}"
+if ! command -v "$SEVEN_ZIP_EXECUTABLE" >/dev/null 2>&1; then
+    echo "unzip: $SEVEN_ZIP_EXECUTABLE command not found. Please install 7-zip or p7zip." >&2
     exit 1
 fi
 
@@ -436,7 +437,7 @@ if (( jflag )) && [[ "$mode" == "x" ]]; then
 fi
 
 # Build the 7z command
-cmd=("7z")
+cmd=("$SEVEN_ZIP_EXECUTABLE")
 
 case "$mode" in
     x)
@@ -544,7 +545,7 @@ fi
 
 # Execute the command
 if [[ "$mode" == "z" ]]; then
-    output=$(7z l -slt "$archive" 2>/dev/null)
+    output=$("$SEVEN_ZIP_EXECUTABLE" l -slt "$archive" 2>/dev/null)
     comment=$(echo "$output" | grep '^Comment = ' | sed 's/^Comment = //')
     if [[ -n "$comment" ]]; then
         echo "$comment"
@@ -578,7 +579,7 @@ else
                     rm -f "$filepath"
                 fi
             fi
-        done < <(7z l "$archive" 2>/dev/null)
+        done < <("$SEVEN_ZIP_EXECUTABLE" l "$archive" 2>/dev/null)
     fi
     # Run 7z command
     "${cmd[@]}"
