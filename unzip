@@ -582,6 +582,31 @@ else
         done < <("$SEVEN_ZIP_EXECUTABLE" l "$archive" 2>/dev/null)
     fi
     # Run 7z command
+    # Set LC_ALL=C to disable g_ForceToUTF8 in 7-zip on Linux, enabling
+    # mbstowcs() fallback for correct filename decoding of legacy archives.
+    # Set OEMCP to the locale-detected code page so both 7-zip and p7zip
+    # decode non-UTF-8 filenames correctly.
+    _sys_locale="${LC_ALL:-${LANG:-C}}"
+    _sys_locale="${_sys_locale%%.*}"
+    _oemcp="437"
+    case "$_sys_locale" in
+        zh_CN|zh_SG) _oemcp="936" ;;
+        zh_TW)       _oemcp="950" ;;
+        zh_HK)       _oemcp="950" ;;
+        ja_JP)       _oemcp="932" ;;
+        ko_KR)       _oemcp="949" ;;
+        ru_RU|uk_UA|be_BY|kk_KZ|ky_KG|mn_MN|uz_UZ|az_AZ) _oemcp="866" ;;
+        cs_CZ|hu_HU|pl_PL|ro_RO|sk_SK|sl_SI|sr_RS) _oemcp="852" ;;
+        fi_FI|et_EE|lt_LT|lv_LV) _oemcp="775" ;;
+        el_GR)       _oemcp="737" ;;
+        he_IL)       _oemcp="862" ;;
+        tr_TR)       _oemcp="857" ;;
+        th_TH)       _oemcp="874" ;;
+        vi_VN)       _oemcp="1258" ;;
+        fa_IR|ar_SA|ar_LB|ar_EG|ar_DZ|ar_BH|ar_IQ|ar_JO|ar_KW|ar_LY|ar_MA|ar_OM|ar_QA|ar_SY|ar_TN|ar_AE|ar_YE) _oemcp="720" ;;
+    esac
+    export LC_ALL=C
+    export OEMCP="$_oemcp"
     "${cmd[@]}"
     # Restore freshen-saved files
     if [[ "$mode" == "x" ]] && (( fflag )); then
